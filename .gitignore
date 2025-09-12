@@ -1,3 +1,11 @@
+data
+outputs
+.agents
+*.ttf
+skills-lock.json
+src-old
+run_safety_shift_vllm.py
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
