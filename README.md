@@ -4,23 +4,34 @@ This repository contains the code for the paper "Understanding and Rectifying Sa
 
 ## Installation
 
+We use [vLLM](https://docs.vllm.ai/en/latest/) to run some of the inference. Since using vLLM to extract hidden states and do steering is a bit tricky, we use Hugging Face as the backend for these tasks.
+
 ```bash
 git clone https://github.com/Renovamen/ShiftDC.git
+cd ShiftDC
+
+conda create --name mm python=3.12
+conda activate mm
+
+uv pip install vllm==0.17.1 --torch-backend=auto
+uv pip install -r requirements.txt
 ```
 
 ## Data
 
 These scripts help prepare data for extracting activations and for evaluation on the jailbreak task. See [DATA.md](DATA.md) for details on what each script does.
 
-First, add your OpenAI API key to the [`.env`](.env) file. Then, run:
+First, rename the [`.env.example`](.env.example) file to `.env` and add your OpenAI API key there. Then, run:
 
 ```bash
 # Download and prepare MM-SafetyBench
-python scripts/prepare_mmsb.py --data_dir data/mmsb 
+python scripts/prepare_mmsb.py --data_dir data/mmsb
+
 # Download and prepare the data for extracting safety shift
 python scripts/prepare_steer.py --data_dir data/steer --mmsb_data_dir data/mmsb
+
 # Download and prepare FigStep
-python scripts/prepare_figstep.py --data_dir data/figstep  
+python scripts/prepare_figstep.py --data_dir data/figstep
 ```
 
 ## Run
