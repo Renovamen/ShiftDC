@@ -2,6 +2,10 @@
 
 This repository contains the code for the paper "Understanding and Rectifying Safety Perception Distortion in VLMs".
 
+![shiftdc-idea](/assets/idea.png)
+
+[[Paper](https://arxiv.org/abs/2502.13095)] [[Poster](https://neurips.cc/media/PosterPDFs/NeurIPS%202025/118667.png)]
+
 ## Installation
 
 We use [vLLM](https://docs.vllm.ai/en/latest/) to run some of the inference. Since using vLLM to extract hidden states and do steering is a bit tricky, we use Hugging Face as the backend for these tasks.
