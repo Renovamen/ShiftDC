@@ -48,37 +48,41 @@ Our pipeline consists of the following steps:
     python run_safety_shift.py \
         -m llava-hf/llava-1.5-7b-hf \
         --input_dir data/steer \
-        --output_dir outputs/safety_shift \
+        --output_dir {step1_dir} \
         --batch_size 32
     ```
 
 2. Generate captions for images:
 
     ```bash
-    python run_caption.py -m "llava-hf/llava-1.5-7b-hf" --data_dir data/mmsb --output_dir outputs
+    python run_caption.py -m "llava-hf/llava-1.5-7b-hf" --data_dir data/mmsb --output_dir {step2_dir}
     ```
 
 3. Extract activations for text-only and vision–language inputs to compute the modality-induced activation shift (Equation 5):
 
     ```bash
-    python run_tt_activation.py -m "llava-hf/llava-1.5-7b-hf" --caption_jsonl {step2_output_path} --data_dir data/mmsb --batch_size 32
+    python run_activation.py --mode tt -m "llava-hf/llava-1.5-7b-hf" --caption_jsonl {step2_dir}/caption.jsonl --data_dir data/mmsb --batch_size 32
 
-    python run_vl_activation.py -m "llava-hf/llava-1.5-7b-hf" --caption_jsonl {step2_output_path} --data_dir data/mmsb --batch_size 16
+    python run_activation.py --mode vl -m "llava-hf/llava-1.5-7b-hf" --caption_jsonl {step2_dir}/caption.jsonl --data_dir data/mmsb --batch_size 16
     ```
+
+    Here `{step2_dir}` is the directory that contains `caption.jsonl` from step 2. These two commands write the following files into the same directory:
+
+    - `tt_activations.npy`
+    - `tt_index.jsonl`
+    - `tt_meta.json`
+    - `vl_activations.npy`
+    - `vl_index.jsonl`
+    - `vl_meta.json`
 
 4. Calibrate the activation shift (Equations 6–7):
 
     ```bash
     python run_shiftdc.py \
         -m llava-hf/llava-1.5-7b-hf \
-        --caption_jsonl {step2_output_path} \
+        --input_dir {step2_dir} \
         --data_dir data/mmsb \
-        --tt_activations_npy {step3_output_path} \
-        --tt_index_jsonl {step3_output_path} \
-        --vl_activations_npy {step3_output_path} \
-        --vl_index_jsonl {step3_output_path} \
         --safety_shift_npy {step1_output_path} \
-        --safety_shift_meta {step1_output_path} \
         --layer_start 10 \
         --layer_end 31
     ```
