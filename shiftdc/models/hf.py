@@ -61,11 +61,11 @@ class HuggingFace(BaseVLM):
         self,
         question: str | list[str],
         image_path: str | Sequence[str] | None,
-    ) -> tuple[list[str], list[str | None]]:
+    ) -> tuple[list[str], list[str] | None]:
         questions = [question] if isinstance(question, str) else list(question)
 
         if image_path is None:
-            image_paths = [None] * len(questions)
+            image_paths = None
         elif isinstance(image_path, str):
             image_paths = [image_path] * len(questions)
         else:
@@ -81,6 +81,22 @@ class HuggingFace(BaseVLM):
         image_path: str | None,
         size: tuple[int, int] | None = None,
     ) -> dict[str, torch.Tensor]:
+        prompt = self._format_chat_prompt(question, image_path is not None)
+        image = None
+        if image_path is not None:
+            image = load_images(image_path, size=size)
+
+        return self.processor(
+            text=prompt,
+            images=image,
+            return_tensors="pt"
+        )
+
+    def _format_chat_prompt(
+        self,
+        question: str,
+        has_image: bool,
+    ) -> str:
         conversation = [
             {
                 "role": "user",
@@ -90,69 +106,53 @@ class HuggingFace(BaseVLM):
                 }]
             }
         ]
-
-        image = None
-        if image_path is not None:
-            image = load_images(image_path, size=size)
+        if has_image:
             conversation[0]["content"].append({"type": "image"})
 
-        prompt = self.processor.apply_chat_template(
+        return self.processor.apply_chat_template(
             conversation,
             add_generation_prompt=True
         )
 
-        return self.processor(
-            text=prompt,
-            images=image,
-            return_tensors="pt"
-        )
-
-    def _build_generation_batch_inputs(
+    def _build_batch_inputs(
         self,
         questions: Sequence[str],
-        image_paths: Sequence[str],
+        image_paths: Sequence[str] | None = None,
         size: tuple[int, int] | None = None,
         max_model_len: int | None = None,
     ) -> dict[str, torch.Tensor]:
-        if len(questions) != len(image_paths):
+        if image_paths is not None and len(questions) != len(image_paths):
             raise ValueError("`questions` and `image_paths` must have the same length.")
         if len(questions) == 0:
-            raise ValueError("Cannot build an empty multimodal batch.")
+            raise ValueError("Cannot build an empty batch.")
 
-        prompts: list[str] = []
-        for question in questions:
-            conversation = [
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": question.replace("<image>", "").strip()
-                        },
-                        {
-                            "type": "image"
-                        }
-                    ]
-                }
-            ]
-            prompt = self.processor.apply_chat_template(
-                conversation,
-                add_generation_prompt=True
-            )
-            prompts.append(prompt)
-
-        images = load_images(list(image_paths), size=size)
+        has_images = image_paths is not None
+        prompts = [
+            self._format_chat_prompt(question, has_image=has_images)
+            for question in questions
+        ]
         kwargs: dict[str, Any] = {
             "text": prompts,
-            "images": images,
             "return_tensors": "pt",
             "padding": True,
             "truncation": True,
         }
         if max_model_len is not None:
             kwargs["max_length"] = max_model_len
+        if image_paths is not None:
+            kwargs["images"] = load_images(list(image_paths), size=size)
 
         return self.processor(**kwargs)
+
+    @staticmethod
+    def _get_last_token_indices(attention_mask: torch.Tensor) -> torch.Tensor:
+        # Build absolute token positions [0, 1, ..., seq_len - 1].
+        positions = torch.arange(attention_mask.shape[1], device=attention_mask.device)
+        # Repeat positions for each batch element so they match attention_mask shape.
+        positions = positions.unsqueeze(0).expand_as(attention_mask)
+        # Set padding positions to -1 so they do not count in the row-wise max,
+        # then use which row-wise max to get the last non-padding token index.
+        return torch.where(attention_mask.bool(), positions, -1).max(dim=1).values
 
     @torch.no_grad()
     def generate(
@@ -200,11 +200,18 @@ class HuggingFace(BaseVLM):
         prompts: list[str],
         batch_size: int,
         max_model_len: int,
-        desc: str,
-        image_paths: Sequence[str | None] | None = None,
-        size: tuple[int, int] | None = None,
-        show_progress: bool = True,
+        image_paths: Sequence[str] | None = None,
+        size: tuple[int, int] | None = None
     ) -> tuple[np.ndarray, int, np.ndarray]:
+        """Extract last-token activations for each prompt across all decoder layers.
+
+        Returns:
+            running_sum: Sum of per-sample last-token activations with shape
+                ``[num_layers, hidden_size]``.
+            count: Number of processed prompts.
+            all_activations: Last-token activations for each sample with shape
+                ``[num_samples, num_layers, hidden_size]``.
+        """
         running_sum: np.ndarray | None = None
         count = 0
         all_activations: list[np.ndarray] = []
@@ -212,125 +219,53 @@ class HuggingFace(BaseVLM):
         device = next(self.model.parameters()).device
         prompts, normalized_image_paths = self._normalize_batch_inputs(prompts, image_paths)
 
-        has_images = any(p is not None for p in normalized_image_paths)
+        has_images = normalized_image_paths is not None
         total_batches = (len(prompts) + batch_size - 1) // batch_size
 
-        prompt_batches = range(0, len(prompts), batch_size)
-        iterator = prompt_batches
-        if show_progress:
-            iterator = tqdm(prompt_batches, total=total_batches, desc=desc)
-
-        for start_idx in iterator:
+        for start_idx in tqdm(
+            range(0, len(prompts), batch_size),
+            total=total_batches,
+            desc="Extract activations"
+        ):
             end_idx = min(start_idx + batch_size, len(prompts))
             batch_prompts = prompts[start_idx:end_idx]
-            batch_images = normalized_image_paths[start_idx:end_idx]
+            batch = self._build_batch_inputs(
+                questions=batch_prompts,
+                image_paths=normalized_image_paths[start_idx:end_idx] if has_images else None,
+                size=size,
+                max_model_len=max_model_len
+            )
+            batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
 
-            if has_images and all(img is not None for img in batch_images):
-                batch = self._build_generation_batch_inputs(
-                    questions=batch_prompts,
-                    image_paths=[str(p) for p in batch_images],
-                    size=size,
-                    max_model_len=max_model_len,
+            outputs = self.model(
+                **batch,
+                output_hidden_states=True,
+                use_cache=False,
+                return_dict=True
+            )
+            hidden_states = outputs.hidden_states
+            # Expect embeddings at index 0 plus at least one decoder-layer activation, since we
+            # drop hidden_states[0] below and stack only per-layer outputs.
+            if hidden_states is None or len(hidden_states) < 2:
+                raise ValueError("Model did not return layer hidden states.")
+
+            hs = torch.stack(hidden_states[1:], dim=0)  # [num_layers, batch_size, seq_len, hidden_size]
+            if hs.shape[0] != self.num_hidden_layers:
+                raise ValueError(
+                    f"Hidden layer count mismatch: got {hs.shape[0]}, expected {self.num_hidden_layers}."
                 )
-                batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
 
-                outputs = self.model(
-                    **batch,
-                    output_hidden_states=True,
-                    use_cache=False,
-                    return_dict=True
-                )
-                hidden_states = outputs.hidden_states
-                if hidden_states is None or len(hidden_states) < 2:
-                    raise ValueError("Model did not return layer hidden states.")
+            last_token_idx = self._get_last_token_indices(batch["attention_mask"])
+            for b in range(hs.shape[1]):
+                token_pos = int(last_token_idx[b].item())
+                last_token = hs[:, b, token_pos, :].float().cpu().numpy()
 
-                hs = torch.stack(hidden_states[1:], dim=0)  # [num_layers, batch_size, seq_len, hidden_size]
-                if hs.shape[0] != self.num_hidden_layers:
-                    raise ValueError(
-                        f"Hidden layer count mismatch: got {hs.shape[0]}, expected {self.num_hidden_layers}."
-                    )
+                if running_sum is None:
+                    running_sum = np.zeros_like(last_token, dtype=np.float64)
+                running_sum += last_token
 
-                attn_mask = batch["attention_mask"]
-                last_token_idx = attn_mask.sum(dim=1) - 1
-                for b in range(hs.shape[1]):
-                    token_pos = int(last_token_idx[b].item())
-                    last_token = hs[:, b, token_pos, :].float().cpu().numpy()
-
-                    if running_sum is None:
-                        running_sum = np.zeros_like(last_token, dtype=np.float64)
-                    running_sum += last_token
-
-                    all_activations.append(last_token.astype(np.float32, copy=False))
-                    count += 1
-            elif has_images:
-                for prompt, image_path in zip(batch_prompts, batch_images):
-                    batch = self._build_generation_inputs(prompt, image_path, size=size)
-                    batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
-
-                    outputs = self.model(
-                        **batch,
-                        output_hidden_states=True,
-                        use_cache=False,
-                        return_dict=True
-                    )
-                    hidden_states = outputs.hidden_states
-                    if hidden_states is None or len(hidden_states) < 2:
-                        raise ValueError("Model did not return layer hidden states.")
-
-                    hs = torch.stack(hidden_states[1:], dim=0)  # [num_layers, 1, seq_len, hidden_size]
-                    if hs.shape[0] != self.num_hidden_layers:
-                        raise ValueError(
-                            f"Hidden layer count mismatch: got {hs.shape[0]}, expected {self.num_hidden_layers}."
-                        )
-
-                    token_pos = int((batch["attention_mask"].sum(dim=1) - 1)[0].item())
-                    last_token = hs[:, 0, token_pos, :].float().cpu().numpy()
-
-                    if running_sum is None:
-                        running_sum = np.zeros_like(last_token, dtype=np.float64)
-                    running_sum += last_token
-
-                    all_activations.append(last_token.astype(np.float32, copy=False))
-                    count += 1
-            else:
-                batch = self.tokenizer(
-                    batch_prompts,
-                    return_tensors="pt",
-                    padding=True,
-                    truncation=True,
-                    max_length=max_model_len
-                )
-                batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
-
-                outputs = self.model(
-                    **batch,
-                    output_hidden_states=True,
-                    use_cache=False,
-                    return_dict=True
-                )
-                hidden_states = outputs.hidden_states
-                if hidden_states is None or len(hidden_states) < 2:
-                    raise ValueError("Model did not return layer hidden states.")
-
-                hs = torch.stack(hidden_states[1:], dim=0)  # [num_layers, batch_size, seq_len, hidden_size]
-                if hs.shape[0] != self.num_hidden_layers:
-                    raise ValueError(
-                        f"Hidden layer count mismatch: got {hs.shape[0]}, expected {self.num_hidden_layers}."
-                    )
-
-                attn_mask = batch["attention_mask"]
-                last_token_idx = attn_mask.sum(dim=1) - 1
-
-                for b in range(hs.shape[1]):
-                    token_pos = int(last_token_idx[b].item())
-                    last_token = hs[:, b, token_pos, :].float().cpu().numpy()
-
-                    if running_sum is None:
-                        running_sum = np.zeros_like(last_token, dtype=np.float64)
-                    running_sum += last_token
-
-                    all_activations.append(last_token.astype(np.float32, copy=False))
-                    count += 1
+                all_activations.append(last_token.astype(np.float32, copy=False))
+                count += 1
 
         if running_sum is None or count == 0:
             raise ValueError("No activations extracted.")

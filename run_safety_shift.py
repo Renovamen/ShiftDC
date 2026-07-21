@@ -94,14 +94,12 @@ def run_safety_shift(
         llava_sum, llava_count, llava_all = hf.extract_last_token_activations(
             prompts=llava_prompts,
             batch_size=batch_size,
-            max_model_len=max_model_len,
-            desc="Extracting llava"
+            max_model_len=max_model_len
         )
         mmsb_sum, mmsb_count, mmsb_all = hf.extract_last_token_activations(
             prompts=mmsb_prompts,
             batch_size=batch_size,
-            max_model_len=max_model_len,
-            desc="Extracting mmsb"
+            max_model_len=max_model_len
         )
     finally:
         hf.del_model()

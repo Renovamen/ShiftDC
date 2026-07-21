@@ -8,29 +8,29 @@ import torch
 from tqdm import tqdm
 
 from shiftdc.models import HuggingFace
-from shiftdc.utils import (
-    add_prefill_hooks,
-    get_parent,
-    load_json,
-    prompt
-)
+from shiftdc.steering import ShiftDCSteeringVector
+from shiftdc.utils import load_json, prompt
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
 
     parser.add_argument("-m", "--model_name", type=str, required=True)
-    parser.add_argument("--caption_jsonl", type=str, required=True)
+
+    parser.add_argument(
+        "--input_dir",
+        type=str,
+        required=True,
+        help="Directory containing caption.jsonl, tt_activations.npy, tt_index.jsonl, vl_activations.npy, and vl_index.jsonl.",
+    )
     parser.add_argument("--data_dir", type=str, required=True)
-    parser.add_argument("--tt_activations_npy", type=str, required=True)
-    parser.add_argument("--tt_index_jsonl", type=str, required=True)
-    parser.add_argument("--vl_activations_npy", type=str, required=True)
-    parser.add_argument("--vl_index_jsonl", type=str, required=True)
     parser.add_argument("--safety_shift_npy", type=str, required=True)
-    parser.add_argument("--safety_shift_meta", type=str, required=True)
+
     parser.add_argument("--layer_start", type=int, default=None)
     parser.add_argument("--layer_end", type=int, default=None)
     parser.add_argument("--alpha", type=float, default=1.0)
+    parser.add_argument("--min_token_index", type=int, default=-1)
+
     parser.add_argument("--max_tokens", type=int, default=128)
 
     return parser.parse_args()
@@ -39,37 +39,14 @@ def _find_decoder_layers(model: torch.nn.Module) -> list[torch.nn.Module]:
     # TODO: avoid hardcoding here
     return list(model.language_model.layers)
 
-def _project_vector(m: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
-    """Projects vector m onto vector s."""
-    denom = torch.dot(s, s)
-
-    if float(denom.item()) <= 0.0:
-        return torch.zeros_like(m)
-
-    return (torch.dot(m, s) / denom) * s
-
-def compute_shift_components(
-    h_qi: torch.Tensor,
-    h_qc: torch.Tensor,
-    safety_shift_by_id: dict[int, torch.Tensor],
-    alpha: float,
-) -> dict[int, torch.Tensor]:
-    corrections: dict[int, torch.Tensor] = {}
-
-    for layer_id, s_vec in safety_shift_by_id.items():
-        m_vec = h_qi[layer_id] - h_qc[layer_id]
-        corrections[layer_id] = alpha * _project_vector(m_vec, s_vec)
-
-    return corrections
-
-
 def generate_steered_hf(
     hf: HuggingFace,
     layer_modules: list[torch.nn.Module],
     device: torch.device,
     prompt_qi: str,
     image_path: str | None,
-    corrections: dict[int, torch.Tensor],
+    steering_vector: ShiftDCSteeringVector,
+    min_token_index: int,
     max_tokens: int,
 ) -> str:
     inputs_qi = hf._build_generation_inputs(question=prompt_qi, image_path=image_path)
@@ -77,7 +54,10 @@ def generate_steered_hf(
     prompt_len = model_inputs["input_ids"].shape[1]
 
     with torch.no_grad():
-        with add_prefill_hooks(layer_modules=layer_modules, corrections=corrections):
+        with steering_vector.apply(
+            layer_modules=layer_modules,
+            min_token_index=min_token_index
+        ):
             output_ids = hf.model.generate(
                 **model_inputs,
                 do_sample=False,
@@ -99,7 +79,7 @@ def _validate_inputs(
     tt_index: list[dict[str, Any]],
     vl_index: list[dict[str, Any]],
     rows: list[dict[str, Any]]
-) -> None:
+) -> tuple[int, int]:
     # Check shape dims
     if safety_shift.ndim != 2:
         raise ValueError(f"Safety shift must be [num_layers, hidden_size], got {safety_shift.shape}.")
@@ -141,52 +121,47 @@ def _validate_inputs(
 
     return num_layers, hidden_size
 
-def _build_layer_maps(
-    safety_shift: np.ndarray,
+def _resolve_layer_range(
     num_layers: int,
     layer_start: int | None,
     layer_end: int | None
-) -> tuple[dict[int, int], dict[int, np.ndarray], int, int]:
+) -> tuple[int, int]:
     ls = (num_layers // 2) if layer_start is None else layer_start
     le = (num_layers - 1) if layer_end is None else layer_end
     if ls < 0 or le < 0 or ls > le or ls >= num_layers or le >= num_layers:
         raise ValueError(f"Invalid layer range [{ls}, {le}].")
 
-    safety_shift_by_id: dict[int, np.ndarray] = {}
-    for layer_id in list(range(ls, le + 1)):
-        safety_shift_by_id[layer_id] = safety_shift[layer_id]
-
-    return safety_shift_by_id, ls, le
+    return ls, le
 
 
 def run_shiftdc(
     model_name: str,
-    caption_jsonl: str,
+    input_dir: str,
     data_dir: str,
-    tt_activations_npy: str,
-    tt_index_jsonl: str,
-    vl_activations_npy: str,
-    vl_index_jsonl: str,
     safety_shift_npy: str,
-    safety_shift_meta: str,
     alpha: float,
     layer_start: int | None,
     layer_end: int | None,
+    min_token_index: int,
     max_tokens: int,
 ) -> Path:
-    caption_path = Path(caption_jsonl).resolve()
+    out_dir = Path(input_dir).resolve()
+    caption_path = out_dir / "caption.jsonl"
     data_root = Path(data_dir).resolve()
-    out_dir = Path(get_parent(str(caption_path)))
-    out_jsonl = out_dir / "shiftdc3.jsonl"
+    out_jsonl = out_dir / "shiftdc.jsonl"
+    tt_activations_path = out_dir / "tt_activations.npy"
+    tt_index_path = out_dir / "tt_index.jsonl"
+    vl_activations_path = out_dir / "vl_activations.npy"
+    vl_index_path = out_dir / "vl_index.jsonl"
 
     rows = load_json(str(caption_path))
 
-    tt_acts = np.load(Path(tt_activations_npy).resolve())
-    vl_acts = np.load(Path(vl_activations_npy).resolve())
+    tt_acts = np.load(tt_activations_path)
+    vl_acts = np.load(vl_activations_path)
     safety_shift = np.load(Path(safety_shift_npy).resolve())
 
-    tt_index = load_json(str(Path(tt_index_jsonl).resolve()))
-    vl_index = load_json(str(Path(vl_index_jsonl).resolve()))
+    tt_index = load_json(str(tt_index_path))
+    vl_index = load_json(str(vl_index_path))
 
     num_layers, hidden_size = _validate_inputs(
         safety_shift,
@@ -197,8 +172,7 @@ def run_shiftdc(
         rows
     )
 
-    safety_shift_by_id_np, ls, le = _build_layer_maps(
-        safety_shift=safety_shift,
+    ls, le = _resolve_layer_range(
         num_layers=num_layers,
         layer_start=layer_start,
         layer_end=layer_end
@@ -213,10 +187,12 @@ def run_shiftdc(
             )
 
         device = next(hf.model.parameters()).device
-        safety_shift_by_id = {
-            layer_id: torch.tensor(vec, dtype=torch.float32, device=device)
-            for layer_id, vec in safety_shift_by_id_np.items()
-        }
+        safety_vector = ShiftDCSteeringVector.from_layer_matrix(
+            torch.from_numpy(safety_shift),
+            range(ls, le + 1),
+            device=device,
+            dtype=torch.float32,
+        )
 
         processed = 0
         with out_jsonl.open("w") as f:
@@ -232,10 +208,9 @@ def run_shiftdc(
                 h_qc = torch.from_numpy(tt_acts[i]).to(device=device, dtype=torch.float32)
                 h_qi = torch.from_numpy(vl_acts[i]).to(device=device, dtype=torch.float32)
 
-                corrections = compute_shift_components(
+                correction_vector = safety_vector.compute_corrections(
                     h_qi=h_qi,
                     h_qc=h_qc,
-                    safety_shift_by_id=safety_shift_by_id,
                     alpha=alpha
                 )
 
@@ -245,7 +220,8 @@ def run_shiftdc(
                     device=device,
                     prompt_qi=prompt_qi,
                     image_path=image_path,
-                    corrections=corrections,
+                    steering_vector=correction_vector,
+                    min_token_index=min_token_index,
                     max_tokens=max_tokens
                 )
 
@@ -257,7 +233,8 @@ def run_shiftdc(
                     "response": response,
                     "alpha": alpha,
                     "layer_start": ls,
-                    "layer_end": le
+                    "layer_end": le,
+                    "min_token_index": min_token_index
                 }
                 for k in ("policy", "image_type", "redteam_query"):
                     if k in row:
@@ -272,21 +249,22 @@ def run_shiftdc(
         "timestamp": datetime.now().strftime("%Y%m%d_%H%M%S"),
         "model_name": model_name,
         "backend": "hf",
+        "input_dir": str(out_dir),
         "caption_jsonl": str(caption_path),
         "data_dir": str(data_root),
-        "tt_activations_npy": str(Path(tt_activations_npy).resolve()),
-        "tt_index_jsonl": str(Path(tt_index_jsonl).resolve()),
-        "vl_activations_npy": str(Path(vl_activations_npy).resolve()),
-        "vl_index_jsonl": str(Path(vl_index_jsonl).resolve()),
+        "tt_activations_npy": str(tt_activations_path),
+        "tt_index_jsonl": str(tt_index_path),
+        "vl_activations_npy": str(vl_activations_path),
+        "vl_index_jsonl": str(vl_index_path),
         "safety_shift_npy": str(Path(safety_shift_npy).resolve()),
-        "safety_shift_meta": str(Path(safety_shift_meta).resolve()),
         "tt_activation_shape": list(tt_acts.shape),
         "vl_activation_shape": list(vl_acts.shape),
         "safety_shift_shape": list(safety_shift.shape),
         "alpha": alpha,
         "layer_start": ls,
         "layer_end": le,
-        "selected_layer_count": len(safety_shift_by_id),
+        "min_token_index": min_token_index,
+        "selected_layer_count": len(safety_vector.layer_vectors),
         "max_tokens": max_tokens,
         "processed": processed
     }
@@ -305,16 +283,12 @@ if __name__ == "__main__":
 
     run_shiftdc(
         model_name=args.model_name,
-        caption_jsonl=args.caption_jsonl,
+        input_dir=args.input_dir,
         data_dir=args.data_dir,
-        tt_activations_npy=args.tt_activations_npy,
-        tt_index_jsonl=args.tt_index_jsonl,
-        vl_activations_npy=args.vl_activations_npy,
-        vl_index_jsonl=args.vl_index_jsonl,
         safety_shift_npy=args.safety_shift_npy,
-        safety_shift_meta=args.safety_shift_meta,
         alpha=args.alpha,
         layer_start=args.layer_start,
         layer_end=args.layer_end,
+        min_token_index=args.min_token_index,
         max_tokens=args.max_tokens
     )
