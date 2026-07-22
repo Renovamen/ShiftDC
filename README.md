@@ -22,7 +22,7 @@ uv pip install --torch-backend=auto -r requirements.txt
 
 ## Data
 
-These scripts help prepare data for extracting activations and for evaluation on the jailbreak task. See [DATA.md](DATA.md) for details on what each script does.
+These scripts help prepare data for extracting activations and for evaluation on the jailbreak task. See [here](scripts/README.md) for details on what each script does.
 
 First, rename the [`.env.example`](.env.example) file to `.env` and add your OpenAI API key there. Then, run:
 
