@@ -17,8 +17,7 @@ cd ShiftDC
 conda create --name mm python=3.12
 conda activate mm
 
-uv pip install vllm==0.17.1 --torch-backend=auto
-uv pip install -r requirements.txt
+uv pip install --torch-backend=auto -r requirements.txt
 ```
 
 ## Data
